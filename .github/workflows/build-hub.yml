@@ -1,0 +1,105 @@
+# Build used by the zJu4nn Hub "Mashups" tab.
+# Compiles the native bridge (LLVM-MinGW) and the Fabric mod (Gradle, JDK 25) from this
+# fork's source and publishes one zip as a release. Toolchains are pinned by version and sha256.
+# Upstream: https://github.com/siddoff/Minecraft-Ring (MIT) — all credit to siddoff and justbustin.
+name: build-hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. hub-v0.3.0-1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      LLVM_URL: https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-x86_64.zip
+      LLVM_SHA256: 317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: LLVM-MinGW (pinned)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:LLVM_URL -OutFile llvm.zip
+          $h = (Get-FileHash llvm.zip -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne $env:LLVM_SHA256) { throw "llvm-mingw sha256 mismatch: $h" }
+          New-Item -ItemType Directory .tools/compiler -Force | Out-Null
+          Expand-Archive llvm.zip .tools/compiler
+          Remove-Item llvm.zip
+
+      - name: Native bridge
+        run: python tools/build_native.py
+
+      - name: Fabric mod
+        shell: pwsh
+        run: |
+          $env:GRADLE_USER_HOME = Join-Path (Get-Location) '.tools\gradle-home'
+          .\bridge-base\elden-ring\mc-bridge\gradlew.bat -p .\bridge-base\elden-ring\mc-bridge --no-daemon --no-configuration-cache build
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = (Get-Content bridge-base/elden-ring/mc-bridge/gradle.properties | Where-Object { $_ -match '^version=' }) -replace '^version=',''
+          $jar = Get-ChildItem bridge-base/elden-ring/mc-bridge/build/libs -Filter "er-bridge-$ver.jar" | Select-Object -First 1
+          if (!$jar) { throw "mod jar not found" }
+          $p = 'pkg'
+          New-Item -ItemType Directory "$p/bridge/erbridge","$p/mods" -Force | Out-Null
+          Copy-Item dist/dinput8.dll "$p/bridge/erbridge_loader.dll"
+          Copy-Item dist/erbridge_core.dll "$p/bridge/erbridge/erbridge_core.dll"
+          Copy-Item $jar.FullName "$p/mods/$($jar.Name)"
+          @(
+            '# Minecraft Ring - offline only: me3 starts Elden Ring with Easy Anti-Cheat off,',
+            '# and the bridge stays passive unless started this way (ERBRIDGE=1).',
+            'profileVersion = "v1"',
+            '',
+            '[[supports]]',
+            'game = "eldenring"',
+            '',
+            '[[natives]]',
+            'path = "bridge/erbridge_loader.dll"'
+          ) | Set-Content "$p/minecraft-ring.me3" -Encoding utf8
+          Copy-Item LICENSE "$p/LICENSE.txt"
+          Copy-Item THIRD_PARTY_NOTICES.md "$p/THIRD_PARTY_NOTICES.md"
+          Copy-Item bridge-base/LICENSE "$p/LICENSE-minecraft-crossover-bridge.txt"
+          Copy-Item bridge-base/elden-ring/er-bridge/third_party/minhook/LICENSE.txt "$p/LICENSE-MinHook.txt"
+          @(
+            "Minecraft Ring $ver (build do zJu4nn Hub)",
+            '',
+            'Minecraft de verdade dentro do Elden Ring. Original de siddoff (github.com/siddoff/Minecraft-Ring),',
+            'baseado no minecraft-crossover-bridge de justbustin. Licenca MIT.',
+            'Somente offline: o Elden Ring abre pelo me3 sem o anti-cheat. Nada entra na pasta do jogo.',
+            'F8 troca o controle entre o Minecraft e o Elden Ring.',
+            'Projeto de fas, sem ligacao com Mojang, Microsoft, FromSoftware ou Bandai Namco.'
+          ) | Set-Content "$p/LEIA.txt" -Encoding utf8
+          $sums = Get-ChildItem $p -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring((Resolve-Path $p).Path.Length + 1).Replace('\','/')
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $rel"
+          }
+          $sums | Set-Content "$p/SHA256SUMS.txt" -Encoding ascii
+          $zip = "minecraft-ring-hub-$ver.zip"
+          Compress-Archive -Path "$p/*" -DestinationPath $zip
+          "ZIP=$zip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VER=$ver" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Get-FileHash $zip -Algorithm SHA256 | Format-List
+
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" $env:ZIP --repo "${{ github.repository }}" --title "Minecraft Ring $env:VER (zJu4nn Hub)" --notes "Build of siddoff/Minecraft-Ring $env:VER for the zJu4nn Hub Mashups tab. Source: this fork at ${{ github.sha }}. MIT."
